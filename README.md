@@ -136,6 +136,8 @@ All defaults live in one place — [`src/config.ts`](src/config.ts) — and each
 
 After editing `config.ts`, run `npm run build` and restart the gateway.
 
+> **Contacts & history:** your address book and recent chats are captured from the sync WhatsApp sends **when you link** (this is how name lookup like *"tell Lior…"* works). Only saved contacts with a phone number are stored; WhatsApp's redundant `@lid` aliases are ignored. To pull your *entire* history instead of just recent, set `WHATSAPP_MCP_SYNC_FULL_HISTORY=true` — but it's much heavier and, on some accounts, WhatsApp rejects the connection (you'll see a reconnect loop), so leave it off unless you need it.
+
 ## Data & privacy
 
 Everything is local, under `~/.whatsapp-mcp/`:
@@ -176,6 +178,7 @@ Then `launchctl load ~/Library/LaunchAgents/com.you.whatsapp-mcp.plist`. Do your
 - **"logged out — re-link required"** → WhatsApp dropped the device. The gateway clears the old session and shows a fresh QR automatically; just scan again.
 - **Two clients** (Desktop + Code) can share the one gateway safely — only the gateway connects to WhatsApp, so there's no double-login conflict.
 - **Nothing to read yet** → the gateway only records messages it receives *while running*. Leave it on to build up recent history.
+- **Name lookup can't find a contact / `whatsapp_status` shows 0 contacts** → your address book only arrives in WhatsApp's sync on a **fresh link**. If you linked earlier and have no contacts, unlink the device on your phone (WhatsApp → Linked Devices), then `npm start` and scan a fresh QR — contacts populate within ~30 s. You can always send by phone number in the meantime.
 
 ## How it works (for the curious)
 

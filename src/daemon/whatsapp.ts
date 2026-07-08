@@ -35,6 +35,7 @@ export class WhatsApp extends EventEmitter {
   private pairingCode: string | null = null;
   private pairRequested = false;
   private stopping = false;
+  private reconnectAttempts = 0;
 
   constructor(private store: Store) {
     super();
@@ -66,7 +67,12 @@ export class WhatsApp extends EventEmitter {
       logger: baileysLogger,
       browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
-      syncFullHistory: false,
+      // Whether to request the entire multi-year backfill (heavy). Configurable.
+      syncFullHistory: config.syncFullHistory,
+      // Always PROCESS the on-login history sync WhatsApp sends — that payload carries
+      // the contact list + chat names. The default gates this behind syncFullHistory,
+      // so we override it explicitly to get contacts even without the full backfill.
+      shouldSyncHistoryMessage: () => true,
       getMessage: async () => undefined,
     });
     this.sock = sock;
@@ -82,6 +88,7 @@ export class WhatsApp extends EventEmitter {
     sock.ev.on('contacts.update', (cs) => this.onContacts(cs));
     sock.ev.on('groups.upsert', (gs) => this.onGroups(gs));
     sock.ev.on('groups.update', (gs) => this.onGroups(gs));
+    sock.ev.on('chats.upsert', (cs) => this.onChats(cs));
     sock.ev.on('messages.upsert', (m) => this.onMessagesUpsert(m));
   }
 
@@ -117,6 +124,7 @@ export class WhatsApp extends EventEmitter {
       this.qr = null;
       this.pairingCode = null;
       this.pairRequested = false;
+      this.reconnectAttempts = 0;
       const user = this.sock?.user;
       if (user?.id) {
         const jid = jidNormalizedUser(user.id);
@@ -146,14 +154,17 @@ export class WhatsApp extends EventEmitter {
         return;
       }
 
-      // Everything else (515 restartRequired, 408 timed out, 428 closed, …) → reconnect.
+      // Everything else (515 restartRequired, 408 timed out, 428 closed, …) → reconnect
+      // with exponential backoff + jitter, so a flaky connection can't hammer WhatsApp.
       this.me = null;
       this.setState('disconnected');
       this.emit('disconnected', code);
-      log.info({ code }, 'Connection closed; reconnecting…');
+      const delay = Math.min(2000 * 2 ** this.reconnectAttempts, 60_000) + Math.floor(Math.random() * 1000);
+      this.reconnectAttempts += 1;
+      log.info({ code, delayMs: delay, attempt: this.reconnectAttempts }, 'Connection closed; reconnecting…');
       setTimeout(() => {
         this.connect().catch((e) => log.error({ err: String(e) }, 'reconnect failed'));
-      }, 2000);
+      }, delay);
     }
   }
 
@@ -176,13 +187,21 @@ export class WhatsApp extends EventEmitter {
 
   // ─── Event → store wiring ─────────────────────────────────────────
   private onHistorySet(h: { contacts?: unknown[]; chats?: unknown[]; messages?: unknown[] }): void {
+    log.debug(
+      { contacts: h.contacts?.length ?? 0, chats: h.chats?.length ?? 0, messages: h.messages?.length ?? 0 },
+      'history sync received',
+    );
     try {
       for (const c of h.contacts ?? []) this.storeContact(c);
-      for (const ch of h.chats ?? []) this.storeChatAsGroup(ch);
+      for (const ch of h.chats ?? []) this.storeChatName(ch);
       for (const m of h.messages ?? []) this.storeMessage(m);
     } catch (e) {
       log.warn({ err: String(e) }, 'history set handling error');
     }
+  }
+
+  private onChats(cs: unknown[]): void {
+    for (const c of cs ?? []) this.storeChatName(c);
   }
 
   private onContacts(cs: unknown[]): void {
@@ -207,7 +226,11 @@ export class WhatsApp extends EventEmitter {
 
   private storeContact(raw: unknown): void {
     const c = raw as { id?: string; name?: string; notify?: string; verifiedName?: string };
-    if (!c?.id || !c.id.endsWith('@s.whatsapp.net')) return;
+    if (!c?.id) return;
+    // Only keep phone-number contacts. WhatsApp also emits redundant "@lid" (Local
+    // Identifier) aliases for the same people; we already have them by number, and
+    // they aren't directly sendable on this Baileys line, so skip them.
+    if (!c.id.endsWith('@s.whatsapp.net')) return;
     const jid = jidNormalizedUser(c.id);
     this.store.upsertContact({
       jid,
@@ -221,6 +244,20 @@ export class WhatsApp extends EventEmitter {
     const ch = raw as { id?: string; name?: string; subject?: string };
     if (!ch?.id || !isJidGroup(ch.id)) return;
     this.store.upsertGroup({ jid: ch.id, subject: ch.subject ?? ch.name ?? null });
+  }
+
+  /** A chat's title. For groups → subject; for a 1:1 → a name fallback so people
+   *  you've chatted with resolve even before a full contact sync lands. */
+  private storeChatName(raw: unknown): void {
+    const ch = raw as { id?: string; name?: string };
+    if (!ch?.id) return;
+    if (isJidGroup(ch.id)) {
+      this.storeChatAsGroup(raw);
+      return;
+    }
+    if (!ch.id.endsWith('@s.whatsapp.net') || !ch.name?.trim()) return;
+    const jid = jidNormalizedUser(ch.id);
+    this.store.upsertContact({ jid, notify: ch.name.trim(), phone: digitsOf(jid) });
   }
 
   private storeMessage(raw: unknown): void {
@@ -262,9 +299,17 @@ export class WhatsApp extends EventEmitter {
         text: text || null,
       });
 
-      // Learn the sender's WhatsApp display name (pushName) without clobbering a saved name.
-      if (!fromMe && isUser && m.pushName) {
-        this.store.upsertContact({ jid: chatJid, notify: m.pushName, phone: digitsOf(chatJid) });
+      // Learn senders' WhatsApp display names (pushName) without clobbering a saved name —
+      // for 1:1 chats and for people who post in your groups (so they become resolvable).
+      if (!fromMe && m.pushName) {
+        if (isUser) {
+          this.store.upsertContact({ jid: chatJid, notify: m.pushName, phone: digitsOf(chatJid) });
+        } else if (isGroup && key.participant) {
+          const pj = jidNormalizedUser(key.participant);
+          if (pj.endsWith('@s.whatsapp.net')) {
+            this.store.upsertContact({ jid: pj, notify: m.pushName, phone: digitsOf(pj) });
+          }
+        }
       }
     } catch (e) {
       log.warn({ err: String(e) }, 'storeMessage error');
