@@ -1,0 +1,37 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP server that sends WhatsApp messages from your own personal number via Baileys, with a hard confirm-before-send rule and human-paced safety guardrails.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/daemon/index.js",
+    "dev": "tsx watch src/daemon/index.ts",
+    "mcp": "node dist/mcp/index.js",
+    "mcp:dev": "tsx src/mcp/index.ts",
+    "status": "node dist/cli/status.js",
+    "pause": "node dist/cli/pause.js",
+    "resume": "node dist/cli/resume.js",
+    "stop": "node dist/cli/stop.js",
+    "link": "node dist/cli/link.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@whiskeysockets/baileys": "6.7.23",
+    "better-sqlite3": "^11.8.0",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
