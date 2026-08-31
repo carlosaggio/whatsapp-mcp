@@ -1,4 +1,4 @@
-import { isJidGroup, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { isJidGroup, isLidUser, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { config } from '../config.js';
 import type { Candidate } from '../types.js';
 import { jidToNumber, startOfTodayMs } from '../util.js';
@@ -48,6 +48,11 @@ export function readMessages(store: Store, input: ReadInput): ReadResult {
       jid = raw;
       kind = 'group';
       name = store.getGroup(jid)?.subject ?? jid;
+    } else if (isLidUser(raw)) {
+      jid = raw;
+      kind = 'contact';
+      const c = store.getContact(jid);
+      name = c?.name ?? c?.notify ?? `LID ${jidToNumber(jid)}`;
     } else {
       jid = jidNormalizedUser(raw);
       kind = 'contact';

@@ -6,6 +6,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   getContentType,
   isJidGroup,
+  isLidUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
@@ -36,6 +37,11 @@ export class WhatsApp extends EventEmitter {
   private pairRequested = false;
   private stopping = false;
   private reconnectAttempts = 0;
+  private lastMessageAt: number | null = null;
+  private lastConnectedAt: number | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private connecting = false;
+
 
   constructor(private store: Store) {
     super();
@@ -48,8 +54,58 @@ export class WhatsApp extends EventEmitter {
     await this.connect();
   }
 
+  private teardownSocket(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    const old = this.sock;
+    this.sock = null;
+    if (!old) return;
+    try {
+      old.ev.removeAllListeners('connection.update');
+      old.ev.removeAllListeners('messages.upsert');
+      old.end(undefined);
+    } catch {
+      // ignore
+    }
+  }
+
+  private websocketOpen(): boolean {
+    const ws = (this.sock as { ws?: { isOpen?: boolean } } | null)?.ws;
+    return ws?.isOpen === true;
+  }
+
+  private startWatchdog(): void {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = setInterval(() => {
+      if (this.stopping || this.state !== 'connected') return;
+      if (!this.websocketOpen()) {
+        log.warn('WebSocket closed while state=connected; forcing reconnect');
+        void this.forceReconnect();
+      }
+    }, 30_000);
+    this.watchdogTimer.unref?.();
+  }
+
+  private async forceReconnect(): Promise<void> {
+    if (this.stopping) return;
+    this.teardownSocket();
+    this.me = null;
+    this.setState('disconnected');
+    this.reconnectAttempts = 0;
+    try {
+      await this.connect();
+    } catch (e) {
+      log.error({ err: String(e) }, 'forced reconnect failed');
+    }
+  }
+
   private async connect(): Promise<void> {
     if (!this.authState) throw new Error('auth state not loaded');
+    if (this.connecting) return;
+    this.connecting = true;
+    this.teardownSocket();
     let version: [number, number, number] | undefined;
     try {
       ({ version } = await fetchLatestBaileysVersion());
@@ -90,6 +146,7 @@ export class WhatsApp extends EventEmitter {
     sock.ev.on('groups.update', (gs) => this.onGroups(gs));
     sock.ev.on('chats.upsert', (cs) => this.onChats(cs));
     sock.ev.on('messages.upsert', (m) => this.onMessagesUpsert(m));
+    this.connecting = false;
   }
 
   private async onConnectionUpdate(u: {
@@ -130,8 +187,10 @@ export class WhatsApp extends EventEmitter {
         const jid = jidNormalizedUser(user.id);
         this.me = { jid, number: jidToNumber(jid), name: user.name ?? undefined };
       }
+      this.lastConnectedAt = Date.now();
       this.setState('connected');
       this.emit('connected', this.me);
+      this.startWatchdog();
       this.refreshGroups().catch((e) => log.warn({ err: String(e) }, 'refreshGroups failed'));
     }
 
@@ -163,6 +222,7 @@ export class WhatsApp extends EventEmitter {
       this.reconnectAttempts += 1;
       log.info({ code, delayMs: delay, attempt: this.reconnectAttempts }, 'Connection closed; reconnecting…');
       setTimeout(() => {
+        this.teardownSocket();
         this.connect().catch((e) => log.error({ err: String(e) }, 'reconnect failed'));
       }, delay);
     }
@@ -227,9 +287,15 @@ export class WhatsApp extends EventEmitter {
   private storeContact(raw: unknown): void {
     const c = raw as { id?: string; name?: string; notify?: string; verifiedName?: string };
     if (!c?.id) return;
-    // Only keep phone-number contacts. WhatsApp also emits redundant "@lid" (Local
-    // Identifier) aliases for the same people; we already have them by number, and
-    // they aren't directly sendable on this Baileys line, so skip them.
+    if (c.id.endsWith('@lid')) {
+      this.store.upsertContact({
+        jid: c.id,
+        name: c.name ?? null,
+        notify: c.notify ?? c.verifiedName ?? null,
+        phone: digitsOf(c.id),
+      });
+      return;
+    }
     if (!c.id.endsWith('@s.whatsapp.net')) return;
     const jid = jidNormalizedUser(c.id);
     this.store.upsertContact({
@@ -275,14 +341,15 @@ export class WhatsApp extends EventEmitter {
         return;
       }
       const isUser = chat.endsWith('@s.whatsapp.net');
+      const isLid = isLidUser(chat);
       const isGroup = isJidGroup(chat);
-      if (!isUser && !isGroup) return;
+      if (!isUser && !isLid && !isGroup) return;
 
       const content = m.message ?? null;
       const type = content ? getContentType(content as never) ?? null : null;
       const text = this.extractText(content);
       const fromMe = key.fromMe ? 1 : 0;
-      const chatJid = isUser ? jidNormalizedUser(chat) : chat;
+      const chatJid = isGroup ? chat : isUser ? jidNormalizedUser(chat) : chat;
       const sender = fromMe
         ? this.me?.jid ?? 'me'
         : key.participant
@@ -298,16 +365,18 @@ export class WhatsApp extends EventEmitter {
         type,
         text: text || null,
       });
+      this.lastMessageAt = Date.now();
 
       // Learn senders' WhatsApp display names (pushName) without clobbering a saved name —
       // for 1:1 chats and for people who post in your groups (so they become resolvable).
       if (!fromMe && m.pushName) {
-        if (isUser) {
+        if (isUser || isLid) {
           this.store.upsertContact({ jid: chatJid, notify: m.pushName, phone: digitsOf(chatJid) });
         } else if (isGroup && key.participant) {
-          const pj = jidNormalizedUser(key.participant);
-          if (pj.endsWith('@s.whatsapp.net')) {
-            this.store.upsertContact({ jid: pj, notify: m.pushName, phone: digitsOf(pj) });
+          const pj = key.participant;
+          if (pj.endsWith('@s.whatsapp.net') || pj.endsWith('@lid')) {
+            const cj = pj.endsWith('@s.whatsapp.net') ? jidNormalizedUser(pj) : pj;
+            this.store.upsertContact({ jid: cj, notify: m.pushName, phone: digitsOf(pj) });
           }
         }
       }
@@ -384,16 +453,20 @@ export class WhatsApp extends EventEmitter {
         messages: this.store.countMessages(),
       },
       dataDir: config.dataDir,
+      syncHealth: {
+        lastMessageAt: this.lastMessageAt,
+        lastConnectedAt: this.lastConnectedAt,
+        websocketOpen: this.websocketOpen(),
+        stale:
+          this.state === 'connected' &&
+          !this.websocketOpen(),
+      },
     };
   }
 
   async shutdown(): Promise<void> {
     this.stopping = true;
-    try {
-      this.sock?.end(undefined);
-    } catch {
-      // ignore
-    }
+    this.teardownSocket();
   }
 
   private setState(s: ConnectionState): void {

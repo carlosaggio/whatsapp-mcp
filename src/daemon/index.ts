@@ -1,4 +1,5 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import qrcodeTerminal from 'qrcode-terminal';
 import { config } from '../config.js';
 import { log } from '../logger.js';
@@ -7,6 +8,29 @@ import { startControlApi } from './api.js';
 import { ensureControlToken } from './control-token.js';
 import { Store } from './store.js';
 import { WhatsApp } from './whatsapp.js';
+
+function acquireLock(): void {
+  const lock = join(config.dataDir, 'gateway.pid');
+  try {
+    const pid = Number(readFileSync(lock, 'utf8').trim());
+    if (pid > 0) process.kill(pid, 0);
+    console.error(`Another WhatsApp gateway is already running (pid ${pid}). Stop it first.`);
+    process.exit(1);
+  } catch {
+    // stale or missing lock
+  }
+  writeFileSync(lock, String(process.pid));
+  const release = () => {
+    try {
+      unlinkSync(lock);
+    } catch {
+      /* ignore */
+    }
+  };
+  process.on('exit', release);
+  process.on('SIGINT', release);
+  process.on('SIGTERM', release);
+}
 
 function banner(): void {
   console.log('╭──────────────────────────────────────────────╮');
@@ -19,11 +43,13 @@ function banner(): void {
 
 function printQr(qr: string): void {
   console.log('\n📱 Scan in WhatsApp → Settings → Linked Devices → Link a device:\n');
+  console.log(`QRRAW:${qr}`);
   qrcodeTerminal.generate(qr, { small: true }, (art) => console.log(art));
 }
 
 async function main(): Promise<void> {
   mkdirSync(config.dataDir, { recursive: true });
+  acquireLock();
   const token = ensureControlToken();
   const store = new Store();
   const wa = new WhatsApp(store);
