@@ -25,6 +25,12 @@ export interface StatusInfo {
   limits: { perMinute: number; perDay: number };
   counts: { contacts: number; groups: number; messages: number };
   dataDir: string;
+  syncHealth: {
+    lastMessageAt: number | null;
+    lastConnectedAt: number | null;
+    websocketOpen: boolean;
+    stale: boolean;
+  };
 }
 
 export type RecipientKind = 'contact' | 'group';

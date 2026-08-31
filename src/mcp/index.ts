@@ -66,6 +66,20 @@ function formatStatus(s: Record<string, unknown>): string {
     `Sent: ${s.sentLastMinute} in last minute, ${s.sentToday} today (limits: ${limits.perMinute}/min, ${limits.perDay}/day)`,
     `Local store: ${counts.contacts} contacts, ${counts.groups} groups, ${counts.messages} recent messages`,
   ];
+  const health = s.syncHealth as {
+    lastMessageAt?: number | null;
+    websocketOpen?: boolean;
+    stale?: boolean;
+  } | undefined;
+  if (health) {
+    const parts: string[] = [];
+    if (health.lastMessageAt) {
+      parts.push(`last message ${new Date(health.lastMessageAt).toLocaleString()}`);
+    }
+    parts.push(`websocket ${health.websocketOpen ? 'open' : 'closed'}`);
+    if (health.stale) parts.push('SYNC STALE: gateway may not be receiving messages');
+    lines.push(`Sync: ${parts.join('; ')}`);
+  }
   if (s.pairingCode) lines.push(`Pairing code: ${s.pairingCode}`);
   return lines.join('\n');
 }
